@@ -5,7 +5,7 @@ set -e
 WG_IF="wg0"
 
 if [[ $EUID -ne 0 ]]; then
-  echo "请用 root 运行这个脚本： sudo bash wg-menu.sh"
+  echo "请用 root 运行这个脚本： sudo bash wg.sh"
   exit 1
 fi
 
@@ -13,7 +13,7 @@ install_wireguard() {
   echo "[*] 检查 WireGuard 及相关依赖..."
 
   # Debian 需要的包
-  NEED_PKGS=(wireguard wireguard-tools iproute2 iptables resolvconf)
+  NEED_PKGS=(wireguard wireguard-tools iproute2 iptables)
   MISSING_PKGS=()
 
   for pkg in "${NEED_PKGS[@]}"; do
@@ -128,6 +128,9 @@ configure_entry() {
   read -rp "请输入【出口服务器公钥】: " EXIT_PUBLIC_KEY
   EXIT_PUBLIC_KEY=${EXIT_PUBLIC_KEY:-CHANGE_ME_EXIT_PUBLIC_KEY}
 
+  # 入口端：访问「出口公网 IP / 出口 WG 内网 IP」才走 wg，其它全部保持原路由
+  ALLOWED_IPS="${EXIT_PUBLIC_IP}/32, ${EXIT_WG_IP}"
+
   mkdir -p /etc/wireguard
   cd /etc/wireguard
 
@@ -150,14 +153,12 @@ configure_entry() {
 [Interface]
 Address = ${WG_ADDR}
 PrivateKey = ${ENTRY_PRIVATE_KEY}
-DNS = 8.8.8.8
 
 [Peer]
 # 出口服务器
 PublicKey = ${EXIT_PUBLIC_KEY}
 Endpoint = ${EXIT_PUBLIC_IP}:${EXIT_PUBLIC_PORT}
-# 如只想内网互通，可改为 ${EXIT_WG_IP}
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = ${ALLOWED_IPS}
 PersistentKeepalive = 25
 EOF
 
@@ -171,8 +172,13 @@ EOF
   wg show || true
 
   echo
-  echo "⚠ 请把上面显示的【入口服务器 公钥】复制到出口服务器，"
-  echo "  再在出口服务器上运行本脚本，选【1 出口服务器】重新写入 Peer。"
+  echo "✅ 当前模式："
+  echo "   - 访问出口公网 IP：${EXIT_PUBLIC_IP} 时走 WireGuard"
+  echo "   - 访问出口 WG 内网 IP：${EXIT_WG_IP} 时走 WireGuard"
+  echo "   - 访问其它任何 IP 都走原来的网络，不改默认路由，不影响 SSH。"
+  echo
+  echo "⚠ 记得把上面显示的【入口服务器 公钥】复制到出口服务器，"
+  echo "  在出口服务器上运行本脚本选【1 出口服务器】写入 Peer。"
 }
 
 show_status() {
@@ -208,7 +214,7 @@ uninstall_wg() {
   echo "  - 停止 wg-quick@${WG_IF} 服务"
   echo "  - 取消开机自启"
   echo "  - 删除 /etc/wireguard/${WG_IF}.conf 和生成的密钥文件"
-  echo "  - 卸载 wireguard 与 wireguard-tools 包（保留 iptables/resolvconf）"
+  echo "  - 卸载 wireguard 与 wireguard-tools 包（保留 iptables/iproute2）"
   echo
   read -rp "确认卸载？(y/N): " confirm
   case "$confirm" in
@@ -237,13 +243,13 @@ uninstall_wg() {
 while true; do
   echo
   echo "================ WireGuard 一键脚本 ================"
-  echo "1) 配置为 出口服务器"
-  echo "2) 配置为 入口服务器"
+  echo "1) 配置为 出口服务器 (有公网 IP 的那台)"
+  echo "2) 配置为 入口服务器 (连出去的那台)"
   echo "3) 查看 WireGuard 状态"
-  echo "4) 启动 WireGuard"
-  echo "5) 停止 WireGuard"
-  echo "6) 重启 WireGuard"
-  echo "7) 卸载 WireGuard"
+  echo "4) 启动 WireGuard (${WG_IF})"
+  echo "5) 停止 WireGuard (${WG_IF})"
+  echo "6) 重启 WireGuard (${WG_IF})"
+  echo "7) 卸载 WireGuard（删除配置和程序）"
   echo "0) 退出"
   echo "===================================================="
   read -rp "请选择: " choice
