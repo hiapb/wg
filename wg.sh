@@ -12,8 +12,8 @@ fi
 install_wireguard() {
   echo "[*] 检查 WireGuard 及相关依赖..."
 
-  # 需要的包列表（Debian 10/11/12 基本都 OK）
-  NEED_PKGS=(wireguard wireguard-tools iproute2 iptables)
+  # Debian 需要的包
+  NEED_PKGS=(wireguard wireguard-tools iproute2 iptables resolvconf)
   MISSING_PKGS=()
 
   for pkg in "${NEED_PKGS[@]}"; do
@@ -93,14 +93,14 @@ EOF
   chmod 600 /etc/wireguard/${WG_IF}.conf
 
   systemctl enable wg-quick@${WG_IF}.service >/dev/null 2>&1 || true
-  systemctl restart wg-quick@${WG_IF}.service
+  systemctl restart wg-quick@${WG_IF}.service || true
 
   echo
   echo "出口服务器配置完成，当前状态："
   wg show || true
 
   echo
-  echo "⚠ 如果刚才入口服务器公钥是空的："
+  echo "⚠ 如果刚才入口服务器公钥是占位符："
   echo "   等你拿到入口服务器公钥后，再次运行本脚本选择【1 出口服务器】，"
   echo "   重新输入入口服务器公钥即可覆盖配置。"
 }
@@ -164,7 +164,7 @@ EOF
   chmod 600 /etc/wireguard/${WG_IF}.conf
 
   systemctl enable wg-quick@${WG_IF}.service >/dev/null 2>&1 || true
-  systemctl restart wg-quick@${WG_IF}.service
+  systemctl restart wg-quick@${WG_IF}.service || true
 
   echo
   echo "入口服务器配置完成，当前状态："
@@ -202,6 +202,38 @@ restart_wg() {
   wg show || true
 }
 
+uninstall_wg() {
+  echo "==== 卸载 WireGuard（删除配置和程序） ===="
+  echo "此操作将会："
+  echo "  - 停止 wg-quick@${WG_IF} 服务"
+  echo "  - 取消开机自启"
+  echo "  - 删除 /etc/wireguard/${WG_IF}.conf 和生成的密钥文件"
+  echo "  - 卸载 wireguard 与 wireguard-tools 包（保留 iptables/resolvconf）"
+  echo
+  read -rp "确认卸载？(y/N): " confirm
+  case "$confirm" in
+    y|Y)
+      systemctl stop wg-quick@${WG_IF}.service 2>/dev/null || true
+      systemctl disable wg-quick@${WG_IF}.service 2>/dev/null || true
+
+      rm -f /etc/wireguard/${WG_IF}.conf \
+            /etc/wireguard/exit_private.key /etc/wireguard/exit_public.key \
+            /etc/wireguard/entry_private.key /etc/wireguard/entry_public.key
+
+      rmdir /etc/wireguard 2>/dev/null || true
+
+      export DEBIAN_FRONTEND=noninteractive
+      apt remove -y wireguard wireguard-tools || true
+      apt autoremove -y || true
+
+      echo "✅ WireGuard 已卸载，配置文件已删除。"
+      ;;
+    *)
+      echo "已取消卸载。"
+      ;;
+  esac
+}
+
 while true; do
   echo
   echo "================ WireGuard 一键脚本 ================"
@@ -211,6 +243,7 @@ while true; do
   echo "4) 启动 WireGuard"
   echo "5) 停止 WireGuard"
   echo "6) 重启 WireGuard"
+  echo "7) 卸载 WireGuard"
   echo "0) 退出"
   echo "===================================================="
   read -rp "请选择: " choice
@@ -222,6 +255,7 @@ while true; do
     4) start_wg ;;
     5) stop_wg ;;
     6) restart_wg ;;
+    7) uninstall_wg ;;
     0) exit 0 ;;
     *) echo "无效选项" ;;
   esac
