@@ -10,7 +10,7 @@ fi
 
 install_wireguard() {
   echo "[*] 检查 WireGuard 及相关依赖..."
-  NEED_PKGS=(wireguard wireguard-tools iproute2 iptables)
+  NEED_PKGS=(wireguard wireguard-tools iproute2 iptables curl)
   MISSING_PKGS=()
 
   for pkg in "${NEED_PKGS[@]}"; do
@@ -48,7 +48,7 @@ configure_exit() {
   if [[ -n "$PUB_IP_DETECTED" ]]; then
     echo "[*] 检测到出口服务器公网 IP 可能是：$PUB_IP_DETECTED"
   else
-    echo "[*] 未能自动检测公网 IP，请参考服务商面板上的 IP。"
+    echo "[*] 未能自动检测公网 IP，请查看服务商面板。"
   fi
 
   read -rp "出口服务器 WireGuard 内网 IP (默认 10.0.0.1/24): " WG_ADDR
@@ -87,7 +87,7 @@ configure_exit() {
   fi
   sysctl -p >/dev/null
 
-  cat > /etc/wireguard/${WG_IF}.conf <<EOF_WG_EXIT
+  cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
 Address = ${WG_ADDR}
 ListenPort = 51820
@@ -99,20 +99,17 @@ PostDown = iptables -D FORWARD -i ${WG_IF} -j ACCEPT; iptables -D FORWARD -o ${W
 [Peer]
 PublicKey = ${ENTRY_PUBLIC_KEY}
 AllowedIPs = ${ENTRY_WG_IP}
-EOF_WG_EXIT
+EOF
 
   chmod 600 /etc/wireguard/${WG_IF}.conf
+
   systemctl enable wg-quick@${WG_IF}.service >/dev/null 2>&1 || true
-  systemctl restart wg-quick@${WG_IF}.service || true
+  wg-quick down ${WG_IF} 2>/dev/null || true
+  wg-quick up ${WG_IF}
 
   echo
   echo "出口服务器配置完成，当前状态："
   wg show || true
-
-  echo
-  echo "⚠ 如果刚才入口服务器公钥是占位符："
-  echo "   等你拿到入口服务器公钥后，再次运行本脚本选择【1 出口服务器】，"
-  echo "   重新输入入口服务器公钥即可覆盖配置。"
 }
 
 configure_entry() {
@@ -126,6 +123,7 @@ configure_entry() {
   read -rp "出口服务器 WireGuard 内网 IP (默认 10.0.0.1/32): " EXIT_WG_IP
   EXIT_WG_IP=${EXIT_WG_IP:-10.0.0.1/32}
 
+  mkdir -p /etc/wireguard
   SAVED_EXIT_IP=""
   if [[ -f /etc/wireguard/.exit_public_ip ]]; then
     SAVED_EXIT_IP=$(cat /etc/wireguard/.exit_public_ip 2>/dev/null || true)
@@ -143,7 +141,6 @@ configure_entry() {
     exit 1
   fi
 
-  mkdir -p /etc/wireguard
   echo "$EXIT_PUBLIC_IP" > /etc/wireguard/.exit_public_ip
 
   read -rp "出口服务器 WireGuard 端口 (默认 51820): " EXIT_PUBLIC_PORT
@@ -151,8 +148,6 @@ configure_entry() {
 
   read -rp "请输入【出口服务器公钥】: " EXIT_PUBLIC_KEY
   EXIT_PUBLIC_KEY=${EXIT_PUBLIC_KEY:-CHANGE_ME_EXIT_PUBLIC_KEY}
-
-  ALLOWED_IPS="${EXIT_WG_IP}"
 
   cd /etc/wireguard
 
@@ -171,44 +166,52 @@ configure_entry() {
   echo "================================================"
   echo
 
-  cat > /etc/wireguard/${WG_IF}.conf <<EOF_WG_ENTRY
+  # 入口端：
+  # - AllowedIPs 包含 出口 WG 内网 IP + 出口公网 IP（让 WG 知道这俩都走这个 peer）
+  # - Table=off 禁止 wg-quick 自动往主路由表加 /32
+  # - PostUp 用 fwmark + table 100 控制 “出口公网 IP 除 51820 外所有流量” 走 wg0
+  cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
 Address = ${WG_ADDR}
 PrivateKey = ${ENTRY_PRIVATE_KEY}
+Table = off
 
-# 策略路由：让“发往出口公网 IP 的所有流量（除了 UDP 51820 握手）”走 WG
-PostUp   = ip rule show | grep -q "fwmark 0x1 lookup 100" || ip rule add fwmark 0x1 lookup 100; \
-           ip route replace ${EXIT_PUBLIC_IP}/32 dev ${WG_IF} table 100; \
-           iptables -t mangle -C OUTPUT -d ${EXIT_PUBLIC_IP} -p udp ! --dport 51820 -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A OUTPUT -d ${EXIT_PUBLIC_IP} -p udp ! --dport 51820 -j MARK --set-mark 0x1; \
-           iptables -t mangle -C OUTPUT -d ${EXIT_PUBLIC_IP} ! -p udp -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A OUTPUT -d ${EXIT_PUBLIC_IP} ! -p udp -j MARK --set-mark 0x1
-PostDown = iptables -t mangle -D OUTPUT -d ${EXIT_PUBLIC_IP} -p udp ! --dport 51820 -j MARK --set-mark 0x1 2>/dev/null || true; \
-           iptables -t mangle -D OUTPUT -d ${EXIT_PUBLIC_IP} ! -p udp -j MARK --set-mark 0x1 2>/dev/null || true; \
-           ip route del ${EXIT_PUBLIC_IP}/32 dev ${WG_IF} table 100 2>/dev/null || true; \
-           ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
+PostUp = \
+  ip rule show | grep -q "fwmark 0x1 lookup 100" || ip rule add fwmark 0x1 lookup 100; \
+  ip route replace ${EXIT_WG_IP} dev ${WG_IF} table 100; \
+  ip route replace ${EXIT_PUBLIC_IP}/32 dev ${WG_IF} table 100; \
+  iptables -t mangle -C OUTPUT -d ${EXIT_PUBLIC_IP} -p udp ! --dport 51820 -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A OUTPUT -d ${EXIT_PUBLIC_IP} -p udp ! --dport 51820 -j MARK --set-mark 0x1; \
+  iptables -t mangle -C OUTPUT -d ${EXIT_PUBLIC_IP} ! -p udp -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A OUTPUT -d ${EXIT_PUBLIC_IP} ! -p udp -j MARK --set-mark 0x1
+
+PostDown = \
+  iptables -t mangle -D OUTPUT -d ${EXIT_PUBLIC_IP} -p udp ! --dport 51820 -j MARK --set-mark 0x1 2>/dev/null || true; \
+  iptables -t mangle -D OUTPUT -d ${EXIT_PUBLIC_IP} ! -p udp -j MARK --set-mark 0x1 2>/dev/null || true; \
+  ip route del ${EXIT_WG_IP} dev ${WG_IF} table 100 2>/dev/null || true; \
+  ip route del ${EXIT_PUBLIC_IP}/32 dev ${WG_IF} table 100 2>/dev/null || true; \
+  ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
 
 [Peer]
 PublicKey = ${EXIT_PUBLIC_KEY}
 Endpoint = ${EXIT_PUBLIC_IP}:${EXIT_PUBLIC_PORT}
-AllowedIPs = ${ALLOWED_IPS}
+AllowedIPs = ${EXIT_WG_IP}, ${EXIT_PUBLIC_IP}/32
 PersistentKeepalive = 25
-EOF_WG_ENTRY
+EOF
 
   chmod 600 /etc/wireguard/${WG_IF}.conf
+
   systemctl enable wg-quick@${WG_IF}.service >/dev/null 2>&1 || true
-  systemctl restart wg-quick@${WG_IF}.service || true
+  wg-quick down ${WG_IF} 2>/dev/null || true
+  wg-quick up ${WG_IF}
 
   echo
   echo "入口服务器配置完成，当前状态："
   wg show || true
 
   echo
-  echo "✅ 当前模式："
-  echo "   - 访问出口 WG 内网 IP：${EXIT_WG_IP} → 走 WireGuard 内网"
-  echo "   - 访问出口公网 IP：${EXIT_PUBLIC_IP} 的所有流量（除 UDP 51820 握手）→ 自动打标记 → 走 WireGuard"
-  echo "   - UDP 51820 握手仍走 eth0，不死锁，不改默认路由、不改 DNS。"
-  echo
-  echo "⚠ 把上面显示的【入口服务器 公钥】复制到出口服务器，"
-  echo "  在出口服务器上运行本脚本选【1 出口服务器】写入 Peer。"
+  echo "✅ 效果："
+  echo "  - 访问出口 WG 内网 IP：${EXIT_WG_IP} → 走 WireGuard 内网"
+  echo "  - 访问出口公网 IP：${EXIT_PUBLIC_IP} 的所有流量（除 UDP 51820）→ 打 mark → table 100 → 走 wg0"
+  echo "  - WG 握手 UDP 51820 仍走默认路由（eth0），不死锁。"
 }
 
 show_status() {
@@ -222,19 +225,20 @@ show_status() {
 
 start_wg() {
   echo "[*] 启动 WireGuard (${WG_IF})..."
-  systemctl start wg-quick@${WG_IF}.service || true
+  wg-quick up ${WG_IF} || true
   wg show || true
 }
 
 stop_wg() {
   echo "[*] 停止 WireGuard (${WG_IF})..."
-  systemctl stop wg-quick@${WG_IF}.service || true
+  wg-quick down ${WG_IF} || true
   wg show || true
 }
 
 restart_wg() {
   echo "[*] 重启 WireGuard (${WG_IF})..."
-  systemctl restart wg-quick@${WG_IF}.service || true
+  wg-quick down ${WG_IF} 2>/dev/null || true
+  wg-quick up ${WG_IF} || true
   wg show || true
 }
 
@@ -243,7 +247,7 @@ uninstall_wg() {
   echo "此操作将会："
   echo "  - 停止 wg-quick@${WG_IF} 服务并取消开机自启"
   echo "  - 删除 /etc/wireguard 内的配置和密钥"
-  echo "  - 移除策略路由 / iptables 标记规则"
+  echo "  - 移除策略路由 / iptables 标记规则（入口机场景）"
   echo "  - 卸载 wireguard 与 wireguard-tools"
   echo "  - 删除当前脚本文件：$0"
   echo
@@ -252,8 +256,9 @@ uninstall_wg() {
     y|Y)
       systemctl stop wg-quick@${WG_IF}.service 2>/dev/null || true
       systemctl disable wg-quick@${WG_IF}.service 2>/dev/null || true
+      wg-quick down ${WG_IF} 2>/dev/null || true
 
-      # 清理策略路由和 mangle 规则（入口机上有效，出口机上无影响）
+      # 尝试读取入口保存的出口 IP，清理规则
       if [[ -f /etc/wireguard/.exit_public_ip ]]; then
         EXIT_PUBLIC_IP=$(cat /etc/wireguard/.exit_public_ip 2>/dev/null || true)
         if [[ -n "$EXIT_PUBLIC_IP" ]]; then
@@ -296,7 +301,7 @@ while true; do
   echo "4) 启动 WireGuard"
   echo "5) 停止 WireGuard"
   echo "6) 重启 WireGuard"
-  echo "7) 卸载 WireGuard（并删除脚本）"
+  echo "7) 卸载 WireGuard"
   echo "0) 退出"
   echo "===================================================="
   read -rp "请选择: " choice
