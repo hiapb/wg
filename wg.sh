@@ -116,7 +116,7 @@ EOF
   wg show || true
 }
 
-# ====================== 入口服务器配置（基础 WG，不含端口） ======================
+# ====================== 入口服务器基础 WG 配置（保留你现在的行为） ======================
 configure_entry() {
   echo "==== 配置为【入口服务器】（连出去的那台） ===="
 
@@ -170,19 +170,22 @@ configure_entry() {
   echo "================================================"
   echo
 
-  # 注意：这里保留「入口基础配置」——只保证：
-  # - 能访问出口内网 IP（10.0.0.1）
-  # - 默认路由不改
-  # 端口分流功能单独通过菜单 8 做，不在这里动。
+  # 这里保留「基础行为」：
+  # - AllowedIPs 只写出口内网 IP，不会动默认路由
+  # 然后在这个基础上再用端口分流，把部分流量通过策略路由拉到 wg0。
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
 Address = ${WG_ADDR}
 PrivateKey = ${ENTRY_PRIVATE_KEY}
+Table = off
+
+PostUp = ip rule show | grep -q "fwmark 0x1 lookup 100" || ip rule add fwmark 0x1 lookup 100; ip route replace default dev ${WG_IF} table 100
+PostDown = ip rule del fwmark 0x1 lookup 100 2>/dev/null || true; ip route flush table 100 2>/dev/null || true
 
 [Peer]
 PublicKey = ${EXIT_PUBLIC_KEY}
 Endpoint = ${EXIT_PUBLIC_IP}:${EXIT_PUBLIC_PORT}
-AllowedIPs = ${EXIT_WG_IP}
+AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
 
@@ -192,35 +195,35 @@ EOF
   wg-quick down ${WG_IF} 2>/dev/null || true
   wg-quick up ${WG_IF}
 
+  # 确保策略路由和现有端口规则立即生效
+  ensure_policy_routing_for_ports
+  apply_port_rules_from_file
+
   echo
   echo "入口服务器基础配置完成，当前状态："
   wg show || true
 
   echo
   echo "✅ 现在："
-  echo "  - 访问出口内网 IP（${EXIT_WG_IP%/*}） 会走 WireGuard 内网"
-  echo "  - 默认路由不变，其它流量走入口自己的公网"
-  echo "  - 端口分流功能请用菜单【8) 管理入口端口分流】单独配置。"
+  echo "  - 只有被端口规则打 mark 的流量才会走 wg0 → 出口机"
+  echo "  - 其它流量走入口自己的公网"
+  echo "  - 端口分流用菜单【8) 管理入口端口分流】添加/删除即可立即生效。"
 }
 
-# ====================== 入口端口分流相关函数 ======================
+# ====================== 入口：策略路由 & 端口分流函数 ======================
 
 ensure_policy_routing_for_ports() {
-  # 给 mark=0x1 的流量建一张单独路由表 100，默认下一跳 wg0
+  # 确保 wg0 存在再搞
+  if ! ip link show "${WG_IF}" &>/dev/null; then
+    return 0
+  fi
+
   if ! ip rule show | grep -q "fwmark 0x1 lookup 100"; then
     ip rule add fwmark 0x1 lookup 100
   fi
 
-  # table 100 默认走 wg0（不改主路由，不影响没打 mark 的流量）
+  # 表 100 默认走 wg0（仅对 mark=0x1 生效，不影响默认路由）
   ip route replace default dev ${WG_IF} table 100
-
-  # 确保本机能直接走 wg0 访问出口内网 IP（10.0.0.1 之类）
-  if ip addr show ${WG_IF} &>/dev/null; then
-    WG_NET=$(ip addr show ${WG_IF} | awk '/inet /{print $2}' | head -n1)
-    if [[ -n "$WG_NET" ]]; then
-      ip route replace $WG_NET dev ${WG_IF} 2>/dev/null || true
-    fi
-  fi
 }
 
 apply_port_rules_from_file() {
@@ -232,7 +235,7 @@ apply_port_rules_from_file() {
     # TCP
     iptables -t mangle -C OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
       iptables -t mangle -A OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1
-    # UDP（如果你只关心 TCP，可以注释掉这两行）
+    # UDP（如果只需要 TCP，可以把下面两行注释掉）
     iptables -t mangle -C OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
       iptables -t mangle -A OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1
   done < "$PORT_LIST_FILE"
@@ -263,16 +266,14 @@ remove_port_from_list() {
 
 remove_port_iptables_rules() {
   local port="$1"
-  # 尝试删除 TCP / UDP 规则
   iptables -t mangle -D OUTPUT -p tcp --dport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
   iptables -t mangle -D OUTPUT -p udp --dport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
 }
 
-# 菜单：入口端口分流管理
 manage_entry_ports() {
   echo "==== 入口服务器 端口分流管理 ===="
-  echo "说明：这里操作的是【入口这台机器】的本地出站流量："
-  echo "  - 所有【目标端口为你指定端口】的 TCP/UDP 出站流量 → 走 WireGuard 内网到出口"
+  echo "说明：这里操作的是【入口这台机器】本地发出的流量："
+  echo "  - 所有【目标端口为列表中端口】的 TCP/UDP 出站流量 → 打 mark=0x1 → 走 wg0 → 出口机"
   echo "  - 其它端口流量 → 仍然走入口自己的公网"
   echo
 
@@ -285,14 +286,13 @@ manage_entry_ports() {
     echo "1) 查看当前分流端口列表"
     echo "2) 添加端口到分流列表"
     echo "3) 从分流列表删除端口"
-    echo "4) 重新应用规则（根据列表刷新 iptables）"
     echo "0) 返回主菜单"
     echo "----------------------"
     read -rp "请选择: " sub
 
     case "$sub" in
       1)
-        echo "当前端口列表（/etc/wireguard/.wg_ports）："
+        echo "当前端口列表（$PORT_LIST_FILE）："
         if [[ -f "$PORT_LIST_FILE" ]] && [[ -s "$PORT_LIST_FILE" ]]; then
           cat "$PORT_LIST_FILE"
         else
@@ -300,10 +300,10 @@ manage_entry_ports() {
         fi
         ;;
       2)
-        read -rp "请输入要添加的端口(单个数字，如 443): " new_port
+        read -rp "请输入要添加的端口(单个数字，如 8080): " new_port
         if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
           add_port_to_list "$new_port"
-          # 即时下发规则
+          ensure_policy_routing_for_ports
           apply_port_rules_from_file
         else
           echo "端口不合法。"
@@ -317,16 +317,6 @@ manage_entry_ports() {
         else
           echo "端口不合法。"
         fi
-        ;;
-      4)
-        echo "重新应用端口分流规则..."
-        # 先粗暴清空所有 mark=0x1 的 OUTPUT 规则，再根据列表重建
-        iptables -t mangle -S OUTPUT 2>/dev/null | grep "MARK set 0x1" | \
-          sed 's/^-A /-D /' | while read -r line; do
-            iptables -t mangle $line 2>/dev/null || true
-          done
-        apply_port_rules_from_file
-        echo "已刷新规则。"
         ;;
       0)
         break
@@ -352,6 +342,8 @@ show_status() {
 start_wg() {
   echo "[*] 启动 WireGuard (${WG_IF})..."
   wg-quick up ${WG_IF} || true
+  ensure_policy_routing_for_ports
+  apply_port_rules_from_file
   wg show || true
 }
 
@@ -365,6 +357,8 @@ restart_wg() {
   echo "[*] 重启 WireGuard (${WG_IF})..."
   wg-quick down ${WG_IF} 2>/dev/null || true
   wg-quick up ${WG_IF} || true
+  ensure_policy_routing_for_ports
+  apply_port_rules_from_file
   wg show || true
 }
 
@@ -421,13 +415,13 @@ while true; do
   echo
   echo "================ WireGuard 一键脚本 ================"
   echo "1) 配置为 出口服务器"
-  echo "2) 配置为 入口服务器（基础 WG，不改默认路由）"
+  echo "2) 配置为 入口服务器"
   echo "3) 查看 WireGuard 状态"
   echo "4) 启动 WireGuard"
   echo "5) 停止 WireGuard"
   echo "6) 重启 WireGuard"
-  echo "7) 卸载 WireGuard（并删除脚本）"
-  echo "8) 管理入口端口分流（添加/查看/删除）"
+  echo "7) 卸载 WireGuard"
+  echo "8) 管理入口端口分流"
   echo "0) 退出"
   echo "===================================================="
   read -rp "请选择: " choice
