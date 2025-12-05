@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-
+ 
 WG_IF="wg0"
 
 if [[ $EUID -ne 0 ]]; then
