@@ -128,8 +128,8 @@ configure_entry() {
   read -rp "请输入【出口服务器公钥】: " EXIT_PUBLIC_KEY
   EXIT_PUBLIC_KEY=${EXIT_PUBLIC_KEY:-CHANGE_ME_EXIT_PUBLIC_KEY}
 
-  # 入口端：访问「出口公网 IP / 出口 WG 内网 IP」才走 wg，其它全部保持原路由
-  ALLOWED_IPS="${EXIT_PUBLIC_IP}/32, ${EXIT_WG_IP}"
+  # 入口端：AllowedIPs 只放出口 WG 内网 IP，避免死锁
+  ALLOWED_IPS="${EXIT_WG_IP}"
 
   mkdir -p /etc/wireguard
   cd /etc/wireguard
@@ -149,10 +149,18 @@ configure_entry() {
   echo "================================================"
   echo
 
+  # 注意：这里在入口上做“出口公网自动走 WG”的策略路由：
+  # - fwmark 0x1 的流量查表 100
+  # - 表 100 里：出口公网IP/32 走 wg0
+  # - 用 mangle OUTPUT 把发往出口公网IP的 TCP 流量打上 mark 1
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
 Address = ${WG_ADDR}
 PrivateKey = ${ENTRY_PRIVATE_KEY}
+
+# 策略路由：让“发往出口公网IP的 TCP 流量”自动走 wg0（但 UDP 51820 握手走原路，不死锁）
+PostUp   = ip rule add fwmark 0x1 lookup 100 || true; ip route add ${EXIT_PUBLIC_IP}/32 dev ${WG_IF} table 100 || true; iptables -t mangle -A OUTPUT -d ${EXIT_PUBLIC_IP} -p tcp -j MARK --set-mark 0x1
+PostDown = iptables -t mangle -D OUTPUT -d ${EXIT_PUBLIC_IP} -p tcp -j MARK --set-mark 0x1 2>/dev/null || true; ip route del ${EXIT_PUBLIC_IP}/32 dev ${WG_IF} table 100 2>/dev/null || true; ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
 
 [Peer]
 # 出口服务器
@@ -173,9 +181,9 @@ EOF
 
   echo
   echo "✅ 当前模式："
-  echo "   - 访问出口公网 IP：${EXIT_PUBLIC_IP} 时走 WireGuard"
   echo "   - 访问出口 WG 内网 IP：${EXIT_WG_IP} 时走 WireGuard"
-  echo "   - 访问其它任何 IP 都走原来的网络，不改默认路由，不影响 SSH。"
+  echo "   - 访问出口公网 IP：${EXIT_PUBLIC_IP} 的 TCP 流量，会自动打标记 → 策略路由走 WireGuard"
+  echo "   - UDP 51820（握手）走原本 eth0，不会死锁，不影响隧道建立。"
   echo
   echo "⚠ 记得把上面显示的【入口服务器 公钥】复制到出口服务器，"
   echo "  在出口服务器上运行本脚本选【1 出口服务器】写入 Peer。"
@@ -242,12 +250,12 @@ uninstall_wg() {
 
 while true; do
   echo
-  echo "================ WireGuard 一键脚本 ================"
+  echo "================ WireGuard 一键脚本 1================"
   echo "1) 配置为 出口服务器"
   echo "2) 配置为 入口服务器"
   echo "3) 查看 WireGuard 状态"
   echo "4) 启动 WireGuard"
-  echo "5) 停止 WireGuar"
+  echo "5) 停止 WireGuard"
   echo "6) 重启 WireGuard"
   echo "7) 卸载 WireGuard"
   echo "0) 退出"
