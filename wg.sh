@@ -243,13 +243,13 @@ uninstall_wg() {
 while true; do
   echo
   echo "================ WireGuard 一键脚本 ================"
-  echo "1) 配置为 出口服务器 (有公网 IP 的那台)"
-  echo "2) 配置为 入口服务器 (连出去的那台)"
+  echo "1) 配置为 出口服务器"
+  echo "2) 配置为 入口服务器"
   echo "3) 查看 WireGuard 状态"
-  echo "4) 启动 WireGuard (${WG_IF})"
-  echo "5) 停止 WireGuard (${WG_IF})"
-  echo "6) 重启 WireGuard (${WG_IF})"
-  echo "7) 卸载 WireGuard（删除配置和程序）"
+  echo "4) 启动 WireGuard"
+  echo "5) 停止 WireGuar"
+  echo "6) 重启 WireGuard"
+  echo "7) 卸载 WireGuard"
   echo "0) 退出"
   echo "===================================================="
   read -rp "请选择: " choice
