@@ -2,7 +2,7 @@
 set -e
 
 # WireGuard 接口名
-WG_IF="wg0"
+WG_IF="wg0" 
 
 if [[ $EUID -ne 0 ]]; then
   echo "请用 root 运行这个脚本： sudo bash wg.sh"
