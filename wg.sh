@@ -130,8 +130,9 @@ ensure_policy_routing_for_ports() {
   ip route replace default dev ${WG_IF} table 100
 }
 
+# 关键修复：清掉 OUTPUT 里所有 MARK 相关规则（不管是全局还是端口）
 clear_mark_rules() {
-  iptables -t mangle -S OUTPUT 2>/dev/null | grep "MARK --set-mark 0x1" \
+  iptables -t mangle -S OUTPUT 2>/dev/null | grep " MARK " \
     | sed 's/^-A /-D /' | while read -r line; do
         iptables -t mangle $line 2>/dev/null || true
       done
@@ -497,14 +498,14 @@ while true; do
   echo
   echo "================ WireGuard 一键脚本 ================"
   echo "1) 配置为 出口服务器"
-  echo "2) 配置为 入口服务器（只配置一次）"
+  echo "2) 配置为 入口服务器"
   echo "3) 查看 WireGuard 状态"
   echo "4) 启动 WireGuard"
   echo "5) 停止 WireGuard"
   echo "6) 重启 WireGuard"
-  echo "7) 卸载 WireGuard（并删除脚本）"
-  echo "8) 管理入口端口分流（添加/查看/删除，自动生效）"
-  echo "9) 管理入口模式（全局 / 端口分流）"
+  echo "7) 卸载 WireGuard"
+  echo "8) 管理入口端口分流"
+  echo "9) 管理入口模式"
   echo "0) 退出"
   echo "===================================================="
   read -rp "请选择: " choice
