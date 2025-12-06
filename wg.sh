@@ -85,11 +85,11 @@ configure_exit() {
   read -rp "请输入【入口服务器公钥】（如果暂时没有可以直接回车跳过）: " ENTRY_PUBLIC_KEY
   ENTRY_PUBLIC_KEY=${ENTRY_PUBLIC_KEY:-CHANGE_ME_ENTRY_PUBLIC_KEY}
 
-  # 开启转发
-  if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+  # 开启 IPv4 转发（兼容 Debian 12，不再用 sysctl -p）
+  echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+  if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
   fi
-  sysctl -p >/dev/null
 
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
@@ -171,9 +171,9 @@ configure_entry() {
   echo
 
   # 入口机：
-  # - Table = off：禁止 wg 改默认路由（SSH 安全）
-  # - AllowedIPs = 0.0.0.0/0：允许通过 wg 发任意目的 IP
-  # - 真正哪些流量走 wg 由 fwmark + table 100 决定（端口分流）
+  # - Table = off：wg 不改默认路由，SSH 安全
+  # - AllowedIPs = 0.0.0.0/0：允许通过 wg 发任意目标 IP
+  # - 真正哪些流量走 wg 由 fwmark + table 100 决定（源端口分流）
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
 Address = ${WG_ADDR}
@@ -206,14 +206,13 @@ EOF
   echo
   echo "✅ 现在："
   echo "  - 访问出口内网 IP（${EXIT_WG_IP%/*}）一律走 WireGuard（不看端口）"
-  echo "  - 访问其它 IP 时，只有【源端口在分流列表里的流量】会走 wg0 → 出口机"
-  echo "  - 其它端口走入口自己的公网，不影响 SSH。"
+  echo "  - 访问其它 IP：只有【源端口在分流列表里的流量】会走 wg0 → 出口机"
+  echo "  - 其它流量走入口自己的公网，不影响 SSH。"
 }
 
 # ====================== 入口：策略路由 & 端口分流 ======================
 
 ensure_policy_routing_for_ports() {
-  # 入口机上，确保 wg0 存在后再改规则
   if ! ip link show "${WG_IF}" &>/dev/null; then
     return 0
   fi
@@ -417,7 +416,7 @@ while true; do
   echo "4) 启动 WireGuard"
   echo "5) 停止 WireGuard"
   echo "6) 重启 WireGuard"
-  echo "7) 卸载 WireGuard（并删除脚本）"
+  echo "7) 卸载 WireGuard"
   echo "8) 管理入口端口分流（添加/查看/删除，自动生效）"
   echo "0) 退出"
   echo "===================================================="
