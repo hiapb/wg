@@ -5,6 +5,7 @@ WG_IF="wg0"
 PORT_LIST_FILE="/etc/wireguard/.wg_ports"
 MODE_FILE="/etc/wireguard/.wg_mode"   # 记录入口当前模式：split / global
 ROLE_FILE="/etc/wireguard/.wg_role"   # 记录当前角色：entry / exit
+EXIT_WG_IP_FILE="/etc/wireguard/.exit_wg_ip"  # 记录出口 WG 内网 IP（不带掩码）
 
 if [[ $EUID -ne 0 ]]; then
   echo "请用 root 运行这个脚本： sudo bash wg.sh"
@@ -205,6 +206,117 @@ set_mode_flag() {
   echo "$mode" > "$MODE_FILE"
 }
 
+# ========== 新增：一些共享小工具 ==========
+
+enable_ip_forward_global() {
+  echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+  sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
+  echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+  sysctl -p >/dev/null 2>&1 || true
+}
+
+get_wan_if() {
+  local wan
+  wan=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
+  echo "${wan:-eth0}"
+}
+
+# ========== 新增：A 的某个端口 → B 同端口 转发（用于分流） ==========
+
+add_forward_port_mapping() {
+  local port="$1"
+  local exit_ip
+  local wan_if
+
+  [[ -z "$port" ]] && return 0
+
+  if [[ -f "$EXIT_WG_IP_FILE" ]]; then
+    exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
+  fi
+  if [[ -z "$exit_ip" ]]; then
+    echo "⚠ 未找到出口 WG 内网 IP (${EXIT_WG_IP_FILE})，跳过 A:${port} → B:${port} 的转发配置。"
+    return 0
+  fi
+
+  enable_ip_forward_global
+  wan_if=$(get_wan_if)
+
+  # 外部打 A:port → DNAT 到 B_wg_ip:port
+  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}"
+
+  # FORWARD 放行
+  iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+
+  iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+  # 出 wg0 做 SNAT/MASQUERADE 兜底
+  iptables -t nat -C POSTROUTING -o "${WG_IF}" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
+
+  echo "✅ 已开启 A:${port} → B(${exit_ip}):${port} 的端口转发（经 ${WG_IF}）"
+}
+
+remove_forward_port_mapping() {
+  local port="$1"
+  local exit_ip
+  local wan_if
+
+  [[ -z "$port" ]] && return 0
+
+  if [[ -f "$EXIT_WG_IP_FILE" ]]; then
+    exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
+  fi
+  [[ -z "$exit_ip" ]] && return 0
+  wan_if=$(get_wan_if)
+
+  iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || true
+  iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+
+  echo "✅ 已尝试移除 A:${port} → B(${exit_ip}):${port} 的转发规则。"
+}
+
+# ========== 新增：全局模式下，全端口 1:1 A→B 转发 ==========
+
+enable_full_port_forward_to_exit_all() {
+  local exit_ip
+  local wan_if
+
+  if [[ -f "$EXIT_WG_IP_FILE" ]]; then
+    exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
+  fi
+  if [[ -z "$exit_ip" ]]; then
+    echo "⚠ 未找到出口 WG 内网 IP (${EXIT_WG_IP_FILE})，跳过全端口 1:1 转发配置。"
+    return 0
+  fi
+
+  enable_ip_forward_global
+  wan_if=$(get_wan_if)
+
+  echo "[*] 开启【全端口 1:1 转发】：A 公网 IP:任意 TCP 端口 → B(${exit_ip}):同端口"
+
+  # 1) 所有从外网进来的 TCP，DNAT 到 B（端口不改）
+  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp -j DNAT --to-destination "${exit_ip}" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp -j DNAT --to-destination "${exit_ip}"
+
+  # 2) FORWARD 放行 外网→wg0
+  iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+
+  # 3) FORWARD 放行 wg0→外网 回程
+  iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+  # 4) 出 wg0 SNAT
+  iptables -t nat -C POSTROUTING -o "${WG_IF}" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
+
+  echo "✅ 已开启【全端口 1:1 转发】：O → A:任意 TCP 端口 = O → B(${exit_ip}):同端口"
+}
+
 enable_global_mode() {
   echo "[*] 切换为【全局模式】..."
   ensure_policy_routing_for_ports
@@ -228,8 +340,11 @@ enable_global_mode() {
   iptables -t mangle -C OUTPUT -j MARK --set-mark 0x1 2>/dev/null || \
     iptables -t mangle -A OUTPUT -j MARK --set-mark 0x1
 
+  # 全局模式下：额外开启【全端口 1:1 A→B 转发】
+  enable_full_port_forward_to_exit_all
+
   set_mode_flag "global"
-  echo "✅ 已切到【全局模式】，全部流量默认通过出口。"
+  echo "✅ 已切到【全局模式】，本机出站全走出口，且 A 公网所有 TCP 端口 1:1 映射到出口 B。"
 }
 
 enable_split_mode() {
@@ -288,6 +403,11 @@ configure_entry() {
 
   mkdir -p /etc/wireguard
   echo "entry" > "$ROLE_FILE"
+
+  # 记录出口 WG 内网 IP（不带掩码，用于 A→B 端口转发）
+  EXIT_WG_IP_NO_MASK="${EXIT_WG_IP%%/*}"
+  echo "$EXIT_WG_IP_NO_MASK" > "$EXIT_WG_IP_FILE"
+
   SAVED_EXIT_IP=""
   if [[ -f /etc/wireguard/.exit_public_ip ]]; then
     SAVED_EXIT_IP=$(cat /etc/wireguard/.exit_public_ip 2>/dev/null || true)
@@ -363,8 +483,8 @@ EOF
 
   echo
   echo "✅ 之后如果要切换："
-  echo "  - 用本脚本菜单 8 管理端口分流。"
-  echo "  - 用本脚本菜单 9 切换【全局模式】 / 【端口分流模式】。"
+  echo "  - 用本脚本菜单 8 管理端口分流"
+  echo "  - 用本脚本菜单 9 切换【全局模式】 / 【端口分流模式】"
 }
 
 manage_entry_ports() {
@@ -372,6 +492,7 @@ manage_entry_ports() {
   echo "说明："
   echo "  - 管的是【入口这台机器】本地源端口的分流规则；"
   echo "  - 源端口在列表中的所有 TCP/UDP 流量 → mark=0x1 → table100 → wg0 → 出口；"
+  echo "  - 同时：外部打到入口 A:这些端口的 TCP，会转发到出口 B 的 WG 内网 IP:同端口；"
   echo "  - 其它端口流量 → 走入口自己的公网。"
   echo
 
@@ -382,7 +503,7 @@ manage_entry_ports() {
     echo "---- 端口管理菜单 ----"
     echo "1) 查看当前分流端口列表"
     echo "2) 添加端口到分流列表"
-    echo "3) 从分流列表删除端口"
+    echo "3) 删除分流列表端口"
     echo "0) 返回主菜单"
     echo "----------------------"
     read -rp "请选择: " sub
@@ -402,6 +523,7 @@ manage_entry_ports() {
           add_port_to_list "$new_port"
           ensure_policy_routing_for_ports
           apply_port_rules_from_file
+          add_forward_port_mapping "$new_port"
         else
           echo "端口不合法。"
         fi
@@ -411,6 +533,7 @@ manage_entry_ports() {
         if [[ "$del_port" =~ ^[0-9]+$ ]]; then
           remove_port_from_list "$del_port"
           remove_port_iptables_rules "$del_port"
+          remove_forward_port_mapping "$del_port"
         else
           echo "端口不合法。"
         fi
@@ -462,8 +585,8 @@ uninstall_wg() {
   echo "==== 卸载 WireGuard ===="
   echo "此操作将会："
   echo "  - 停止 wg-quick@${WG_IF} 服务并取消开机自启"
-  echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置、模式配置"
-  echo "  - 移除策略路由 / iptables 标记 / NAT 规则"
+  echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置、模式配置、角色信息"
+  echo "  - 尝试移除端口转发 / 策略路由 / iptables 标记 / NAT 规则"
   echo "  - 卸载 wireguard 与 wireguard-tools"
   echo "  - 删除当前脚本文件：$0"
   echo
@@ -473,6 +596,25 @@ uninstall_wg() {
       systemctl stop wg-quick@${WG_IF}.service 2>/dev/null || true
       systemctl disable wg-quick@${WG_IF}.service 2>/dev/null || true
       wg-quick down ${WG_IF} 2>/dev/null || true
+
+      # 尝试移除分流端口对应的转发规则
+      if [[ -f "$PORT_LIST_FILE" ]]; then
+        while read -r p; do
+          [[ -z "$p" ]] && continue
+          remove_forward_port_mapping "$p"
+        done < "$PORT_LIST_FILE"
+      fi
+
+      # 尝试移除全端口 1:1 转发规则
+      if [[ -f "$EXIT_WG_IP_FILE" ]]; then
+        exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
+        if [[ -n "$exit_ip" ]]; then
+          wan_if=$(get_wan_if)
+          iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp -j DNAT --to-destination "${exit_ip}" 2>/dev/null || true
+          iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+          iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        fi
+      fi
 
       ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
       ip route flush table 100 2>/dev/null || true
@@ -484,14 +626,14 @@ uninstall_wg() {
             /etc/wireguard/exit_private.key /etc/wireguard/exit_public.key \
             /etc/wireguard/entry_private.key /etc/wireguard/entry_public.key \
             /etc/wireguard/.exit_public_ip \
-            "$PORT_LIST_FILE" "$MODE_FILE" 2>/dev/null || true
+            "$PORT_LIST_FILE" "$MODE_FILE" "$ROLE_FILE" "$EXIT_WG_IP_FILE" 2>/dev/null || true
       rmdir /etc/wireguard 2>/dev/null || true
 
       export DEBIAN_FRONTEND=noninteractive
       apt remove -y wireguard wireguard-tools 2>/dev/null || true
       apt autoremove -y 2>/dev/null || true
 
-      echo "✅ WireGuard 已卸载，配置和端口分流规则已清理。"
+      echo "✅ WireGuard 已卸载，配置和端口分流/转发规则已尽量清理。"
       echo "✅ 正在删除当前脚本：$0"
       rm -f "$0" 2>/dev/null || true
       echo "✅ 脚本已删除，退出。"
@@ -516,7 +658,7 @@ while true; do
   echo "6) 重启 WireGuard"
   echo "7) 卸载 WireGuard"
   echo "8) 管理入口端口分流"
-  echo "9) 管理入口模式"
+  echo "9) 管理入口模式（全局 / 分流）"
   echo "0) 退出"
   echo "===================================================="
   read -rp "请选择: " choice
@@ -531,14 +673,14 @@ while true; do
     7) uninstall_wg ;;
     8)
       if [[ $(get_role) != "entry" ]]; then
-        echo "当前为【出口服务器】或尚未配置为入口，本菜单仅在入口服务器上可用，按回车返回。"
+        echo "当前为【出口服务器】或尚未配置为入口，本菜单仅在入口服务器上可用。"
       else
         manage_entry_ports
       fi
       ;;
     9)
       if [[ $(get_role) != "entry" ]]; then
-        echo "当前为【出口服务器】或尚未配置为入口，本菜单仅在入口服务器上可用，按回车返回。"
+        echo "当前为【出口服务器】或尚未配置为入口，本菜单仅在入口服务器上可用。"
       else
         manage_entry_mode
       fi
