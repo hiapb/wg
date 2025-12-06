@@ -4,6 +4,7 @@ set -e
 WG_IF="wg0"
 PORT_LIST_FILE="/etc/wireguard/.wg_ports"
 MODE_FILE="/etc/wireguard/.wg_mode"   # 记录入口当前模式：split / global
+ROLE_FILE="/etc/wireguard/.wg_role"   # 记录当前角色：entry / exit
 
 if [[ $EUID -ne 0 ]]; then
   echo "请用 root 运行这个脚本： sudo bash wg.sh"
@@ -28,6 +29,14 @@ install_wireguard() {
   export DEBIAN_FRONTEND=noninteractive
   apt update
   apt install -y "${MISSING_PKGS[@]}"
+}
+
+get_role() {
+  if [[ -f "$ROLE_FILE" ]]; then
+    cat "$ROLE_FILE"
+  else
+    echo "unknown"
+  fi
 }
 
 detect_public_ip() {
@@ -65,6 +74,7 @@ configure_exit() {
   OUT_IF=${OUT_IF:-${DEFAULT_IF:-eth0}}
 
   mkdir -p /etc/wireguard
+  echo "exit" > "$ROLE_FILE"
   cd /etc/wireguard
 
   if [ ! -f exit_private.key ]; then
@@ -277,6 +287,7 @@ configure_entry() {
   EXIT_WG_IP=${EXIT_WG_IP:-10.0.0.1/32}
 
   mkdir -p /etc/wireguard
+  echo "entry" > "$ROLE_FILE"
   SAVED_EXIT_IP=""
   if [[ -f /etc/wireguard/.exit_public_ip ]]; then
     SAVED_EXIT_IP=$(cat /etc/wireguard/.exit_public_ip 2>/dev/null || true)
@@ -518,8 +529,20 @@ while true; do
     5) stop_wg ;;
     6) restart_wg ;;
     7) uninstall_wg ;;
-    8) manage_entry_ports ;;
-    9) manage_entry_mode ;;
+    8)
+      if [[ $(get_role) != "entry" ]]; then
+        echo "当前为【出口服务器】或尚未配置为入口，本菜单仅在入口服务器上可用，按回车返回。"
+      else
+        manage_entry_ports
+      fi
+      ;;
+    9)
+      if [[ $(get_role) != "entry" ]]; then
+        echo "当前为【出口服务器】或尚未配置为入口，本菜单仅在入口服务器上可用，按回车返回。"
+      else
+        manage_entry_mode
+      fi
+      ;;
     0) exit 0 ;;
     *) echo "无效选项。" ;;
   esac
