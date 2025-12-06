@@ -43,7 +43,7 @@ detect_public_ip() {
 
 # ====================== 出口服务器配置 ======================
 configure_exit() {
-  echo "==== 配置为【出口服务器】（有公网 IP 的那台） ===="
+  echo "==== 配置为【出口服务器】 ===="
 
   install_wireguard
 
@@ -82,7 +82,7 @@ configure_exit() {
   echo "================================================"
   echo
 
-  read -rp "请输入【入口服务器公钥】（如果暂时没有可以直接回车跳过）: " ENTRY_PUBLIC_KEY
+  read -rp "请输入【入口服务器公钥】: " ENTRY_PUBLIC_KEY
   ENTRY_PUBLIC_KEY=${ENTRY_PUBLIC_KEY:-CHANGE_ME_ENTRY_PUBLIC_KEY}
 
   # 开启 IPv4 转发
@@ -196,7 +196,7 @@ set_mode_flag() {
 }
 
 enable_global_mode() {
-  echo "[*] 切换为【全局模式（除 SSH/WG/lo 外全部走出口）】..."
+  echo "[*] 切换为【全局模式】..."
   ensure_policy_routing_for_ports
   clear_mark_rules
 
@@ -219,7 +219,7 @@ enable_global_mode() {
     iptables -t mangle -A OUTPUT -j MARK --set-mark 0x1
 
   set_mode_flag "global"
-  echo "✅ 已切到【全局模式】，SSH 不走 wg，其它流量默认通过出口。"
+  echo "✅ 已切到【全局模式】，全部流量默认通过出口。"
 }
 
 enable_split_mode() {
@@ -248,8 +248,8 @@ manage_entry_mode() {
     mode=$(get_current_mode)
     echo
     echo "当前模式：$mode"
-    echo "1) 切换为【全局模式】（除 SSH/WG/lo 外全部走出口）"
-    echo "2) 切换为【端口分流模式】（只列表端口走出口）"
+    echo "1) 切换为【全局模式】"
+    echo "2) 切换为【端口分流模式】"
     echo "3) 仅查看当前模式"
     echo "0) 返回主菜单"
     read -rp "请选择: " sub
@@ -266,7 +266,7 @@ manage_entry_mode() {
 # ====================== 入口服务器配置（只配一次） ======================
 
 configure_entry() {
-  echo "==== 配置为【入口服务器】（只配置一次，之后用模式切换） ===="
+  echo "==== 配置为【入口服务器】 ===="
 
   install_wireguard
 
@@ -313,7 +313,7 @@ configure_entry() {
   ENTRY_PUBLIC_KEY=$(cat entry_public.key)
 
   echo
-  echo "====== 入口服务器 公钥（发给出口服务器用）======"
+  echo "====== 入口服务器 公钥======"
   echo "${ENTRY_PUBLIC_KEY}"
   echo "================================================"
   echo
@@ -352,7 +352,7 @@ EOF
 
   echo
   echo "✅ 之后如果要切换："
-  echo "  - 用本脚本菜单 8 管理端口分流（列表）。"
+  echo "  - 用本脚本菜单 8 管理端口分流。"
   echo "  - 用本脚本菜单 9 切换【全局模式】 / 【端口分流模式】。"
 }
 
@@ -370,8 +370,8 @@ manage_entry_ports() {
     echo
     echo "---- 端口管理菜单 ----"
     echo "1) 查看当前分流端口列表"
-    echo "2) 添加端口到分流列表（立即生效）"
-    echo "3) 从分流列表删除端口（立即生效）"
+    echo "2) 添加端口到分流列表"
+    echo "3) 从分流列表删除端口"
     echo "0) 返回主菜单"
     echo "----------------------"
     read -rp "请选择: " sub
@@ -448,7 +448,7 @@ restart_wg() {
 }
 
 uninstall_wg() {
-  echo "==== 卸载 WireGuard（删除配置和程序 + 本脚本） ===="
+  echo "==== 卸载 WireGuard ===="
   echo "此操作将会："
   echo "  - 停止 wg-quick@${WG_IF} 服务并取消开机自启"
   echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置、模式配置"
