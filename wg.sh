@@ -116,7 +116,7 @@ EOF
   wg show || true
 }
 
-# ====================== 入口服务器基础 WG 配置（保留你现在的行为） ======================
+# ====================== 入口服务器配置 ======================
 configure_entry() {
   echo "==== 配置为【入口服务器】（连出去的那台） ===="
 
@@ -170,9 +170,10 @@ configure_entry() {
   echo "================================================"
   echo
 
-  # 这里保留「基础行为」：
-  # - AllowedIPs 只写出口内网 IP，不会动默认路由
-  # 然后在这个基础上再用端口分流，把部分流量通过策略路由拉到 wg0。
+  # 入口机：
+  # - Table = off：禁止 wg 改默认路由（SSH 安全）
+  # - AllowedIPs = 0.0.0.0/0：允许通过 wg 发任意目的 IP
+  # - 真正哪些流量走 wg 由 fwmark + table 100 决定（端口分流）
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
 Address = ${WG_ADDR}
@@ -195,7 +196,6 @@ EOF
   wg-quick down ${WG_IF} 2>/dev/null || true
   wg-quick up ${WG_IF}
 
-  # 确保策略路由和现有端口规则立即生效
   ensure_policy_routing_for_ports
   apply_port_rules_from_file
 
@@ -205,15 +205,15 @@ EOF
 
   echo
   echo "✅ 现在："
-  echo "  - 只有被端口规则打 mark 的流量才会走 wg0 → 出口机"
-  echo "  - 其它流量走入口自己的公网"
-  echo "  - 端口分流用菜单【8) 管理入口端口分流】添加/删除即可立即生效。"
+  echo "  - 访问出口内网 IP（${EXIT_WG_IP%/*}）一律走 WireGuard（不看端口）"
+  echo "  - 访问其它 IP 时，只有【源端口在分流列表里的流量】会走 wg0 → 出口机"
+  echo "  - 其它端口走入口自己的公网，不影响 SSH。"
 }
 
-# ====================== 入口：策略路由 & 端口分流函数 ======================
+# ====================== 入口：策略路由 & 端口分流 ======================
 
 ensure_policy_routing_for_ports() {
-  # 确保 wg0 存在再搞
+  # 入口机上，确保 wg0 存在后再改规则
   if ! ip link show "${WG_IF}" &>/dev/null; then
     return 0
   fi
@@ -222,7 +222,6 @@ ensure_policy_routing_for_ports() {
     ip rule add fwmark 0x1 lookup 100
   fi
 
-  # 表 100 默认走 wg0（仅对 mark=0x1 生效，不影响默认路由）
   ip route replace default dev ${WG_IF} table 100
 }
 
@@ -232,12 +231,11 @@ apply_port_rules_from_file() {
   while read -r p; do
     [[ -z "$p" ]] && continue
     [[ "$p" =~ ^# ]] && continue
-    # TCP
-    iptables -t mangle -C OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
-      iptables -t mangle -A OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1
-    # UDP（如果只需要 TCP，可以把下面两行注释掉）
-    iptables -t mangle -C OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
-      iptables -t mangle -A OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1
+    # 按“源端口”分流：本机哪个源端口的流量要走 wg
+    iptables -t mangle -C OUTPUT -p tcp --sport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p tcp --sport "$p" -j MARK --set-mark 0x1
+    iptables -t mangle -C OUTPUT -p udp --sport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p udp --sport "$p" -j MARK --set-mark 0x1
   done < "$PORT_LIST_FILE"
 }
 
@@ -266,26 +264,26 @@ remove_port_from_list() {
 
 remove_port_iptables_rules() {
   local port="$1"
-  iptables -t mangle -D OUTPUT -p tcp --dport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
-  iptables -t mangle -D OUTPUT -p udp --dport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p tcp --sport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p udp --sport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
 }
 
 manage_entry_ports() {
   echo "==== 入口服务器 端口分流管理 ===="
-  echo "说明：这里操作的是【入口这台机器】本地发出的流量："
-  echo "  - 所有【目标端口为列表中端口】的 TCP/UDP 出站流量 → 打 mark=0x1 → 走 wg0 → 出口机"
-  echo "  - 其它端口流量 → 仍然走入口自己的公网"
+  echo "说明："
+  echo "  - 这里管理的是【入口这台机器】本地源端口的分流规则；"
+  echo "  - 源端口在列表中的所有 TCP/UDP 流量 → 打 mark=0x1 → 经 wg0 → 出口机 NAT 出网；"
+  echo "  - 其它端口流量 → 走入口自己的公网。"
   echo
 
-  # 确保策略路由存在
   ensure_policy_routing_for_ports
 
   while true; do
     echo
     echo "---- 端口管理菜单 ----"
     echo "1) 查看当前分流端口列表"
-    echo "2) 添加端口到分流列表"
-    echo "3) 从分流列表删除端口"
+    echo "2) 添加端口到分流列表（立即生效）"
+    echo "3) 从分流列表删除端口（立即生效）"
     echo "0) 返回主菜单"
     echo "----------------------"
     read -rp "请选择: " sub
@@ -366,7 +364,7 @@ uninstall_wg() {
   echo "==== 卸载 WireGuard（删除配置和程序 + 本脚本） ===="
   echo "此操作将会："
   echo "  - 停止 wg-quick@${WG_IF} 服务并取消开机自启"
-  echo "  - 删除 /etc/wireguard 内的配置和密钥"
+  echo "  - 删除 /etc/wireguard 内的配置和密钥、端口分流配置"
   echo "  - 移除策略路由 / iptables 标记规则"
   echo "  - 卸载 wireguard 与 wireguard-tools"
   echo "  - 删除当前脚本文件：$0"
@@ -378,13 +376,12 @@ uninstall_wg() {
       systemctl disable wg-quick@${WG_IF}.service 2>/dev/null || true
       wg-quick down ${WG_IF} 2>/dev/null || true
 
-      # 清理策略路由和 mangle
       ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
       ip route flush table 100 2>/dev/null || true
-      iptables -t mangle -S OUTPUT 2>/dev/null | grep "MARK set 0x1" | \
-        sed 's/^-A /-D /' | while read -r line; do
-          iptables -t mangle $line 2>/dev/null || true
-        done
+      iptables -t mangle -S OUTPUT 2>/dev/null | grep "MARK set 0x1" \
+        | sed 's/^-A /-D /' | while read -r line; do
+            iptables -t mangle $line 2>/dev/null || true
+          done
 
       rm -f /etc/wireguard/${WG_IF}.conf \
             /etc/wireguard/exit_private.key /etc/wireguard/exit_public.key \
@@ -415,13 +412,13 @@ while true; do
   echo
   echo "================ WireGuard 一键脚本 ================"
   echo "1) 配置为 出口服务器"
-  echo "2) 配置为 入口服务器"
+  echo "2) 配置为 入口服务器（端口分流 + 内网直连）"
   echo "3) 查看 WireGuard 状态"
   echo "4) 启动 WireGuard"
   echo "5) 停止 WireGuard"
   echo "6) 重启 WireGuard"
-  echo "7) 卸载 WireGuard"
-  echo "8) 管理入口端口分流"
+  echo "7) 卸载 WireGuard（并删除脚本）"
+  echo "8) 管理入口端口分流（添加/查看/删除，自动生效）"
   echo "0) 退出"
   echo "===================================================="
   read -rp "请选择: " choice
