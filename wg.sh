@@ -59,7 +59,6 @@ configure_exit() {
   read -rp "入口服务器 WireGuard 内网 IP (默认 10.0.0.2/32): " ENTRY_WG_IP
   ENTRY_WG_IP=${ENTRY_WG_IP:-10.0.0.2/32}
 
-  # 探测出口物理网卡
   DEFAULT_IF=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
   read -rp "出口服务器对外网卡名(默认 ${DEFAULT_IF:-eth0}): " OUT_IF
   OUT_IF=${OUT_IF:-${DEFAULT_IF:-eth0}}
@@ -85,7 +84,7 @@ configure_exit() {
   read -rp "请输入【入口服务器公钥】（如果暂时没有可以直接回车跳过）: " ENTRY_PUBLIC_KEY
   ENTRY_PUBLIC_KEY=${ENTRY_PUBLIC_KEY:-CHANGE_ME_ENTRY_PUBLIC_KEY}
 
-  # 开启 IPv4 转发（兼容 Debian 12，不再用 sysctl -p）
+  # 开启 IPv4 转发（不用 sysctl -p，避免报错中断）
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
   if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
@@ -98,7 +97,7 @@ ListenPort = 51820
 PrivateKey = ${EXIT_PRIVATE_KEY}
 
 PostUp   = iptables -A FORWARD -i ${WG_IF} -j ACCEPT; iptables -A FORWARD -o ${WG_IF} -j ACCEPT; iptables -t nat -A POSTROUTING -o ${OUT_IF} -j MASQUERADE
-PostDown = iptables -D FORWARD -i ${WG_IF} -j ACCEPT; iptables -D FORWARD -o ${WG_IF} -j ACCEPT; iptables -t nat -D POSTROUTING -o ${OUT_IF} -j MASQUERADE
+PostDown = iptables -D FORWARD -i ${WG_IF} -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o ${WG_IF} -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -o ${OUT_IF} -j MASQUERADE 2>/dev/null || true
 
 [Peer]
 PublicKey = ${ENTRY_PUBLIC_KEY}
@@ -117,8 +116,71 @@ EOF
 }
 
 # ====================== 入口服务器配置 ======================
+
+ensure_policy_routing_for_ports() {
+  if ! ip link show "${WG_IF}" &>/dev/null; then
+    return 0
+  fi
+
+  if ! ip rule show | grep -q "fwmark 0x1 lookup 100"; then
+    ip rule add fwmark 0x1 lookup 100
+  fi
+
+  ip route replace default dev ${WG_IF} table 100
+}
+
+clear_mark_rules() {
+  iptables -t mangle -S OUTPUT 2>/dev/null | grep "MARK --set-xmark 0x1" \
+    | sed 's/^-A /-D /' | while read -r line; do
+        iptables -t mangle $line 2>/dev/null || true
+      done
+}
+
+apply_port_rules_from_file() {
+  clear_mark_rules
+  [[ ! -f "$PORT_LIST_FILE" ]] && return 0
+
+  while read -r p; do
+    [[ -z "$p" ]] && continue
+    [[ "$p" =~ ^# ]] && continue
+    iptables -t mangle -C OUTPUT -p tcp --sport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p tcp --sport "$p" -j MARK --set-mark 0x1
+    iptables -t mangle -C OUTPUT -p udp --sport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p udp --sport "$p" -j MARK --set-mark 0x1
+  done < "$PORT_LIST_FILE"
+}
+
+add_port_to_list() {
+  local port="$1"
+  mkdir -p "$(dirname "$PORT_LIST_FILE")"
+  touch "$PORT_LIST_FILE"
+  if grep -qx "$port" "$PORT_LIST_FILE"; then
+    echo "端口 $port 已存在列表中。"
+    return 0
+  fi
+  echo "$port" >> "$PORT_LIST_FILE"
+  echo "已添加端口 $port 到分流列表。"
+}
+
+remove_port_from_list() {
+  local port="$1"
+  [[ ! -f "$PORT_LIST_FILE" ]] && return 0
+  if ! grep -qx "$port" "$PORT_LIST_FILE"; then
+    echo "端口 $port 不在列表中。"
+    return 0
+  fi
+  sed -i "\|^$port$|d" "$PORT_LIST_FILE"
+  echo "已从分流列表中删除端口 $port。"
+}
+
+remove_port_iptables_rules() {
+  local port="$1"
+  iptables -t mangle -D OUTPUT -p tcp --sport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p udp --sport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+}
+
 configure_entry() {
-  echo "==== 配置为【入口服务器】（连出去的那台） ===="
+  echo "==== 配置为【入口服务器】（连出去的那台，端口分流 + 内网直连） ===="
 
   install_wireguard
 
@@ -170,18 +232,16 @@ configure_entry() {
   echo "================================================"
   echo
 
-  # 入口机：
-  # - Table = off：wg 不改默认路由，SSH 安全
-  # - AllowedIPs = 0.0.0.0/0：允许通过 wg 发任意目标 IP
-  # - 真正哪些流量走 wg 由 fwmark + table 100 决定（源端口分流）
+  # 入口机：Table=off，不改默认路由；用 fwmark+table100 做分流
+  # PostUp 里：建策略路由 & NAT 到 wg0（SNAT/MASQUERADE 成 10.0.0.2）
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
 Address = ${WG_ADDR}
 PrivateKey = ${ENTRY_PRIVATE_KEY}
 Table = off
 
-PostUp = ip rule show | grep -q "fwmark 0x1 lookup 100" || ip rule add fwmark 0x1 lookup 100; ip route replace default dev ${WG_IF} table 100
-PostDown = ip rule del fwmark 0x1 lookup 100 2>/dev/null || true; ip route flush table 100 2>/dev/null || true
+PostUp   = ip rule show | grep -q "fwmark 0x1 lookup 100" || ip rule add fwmark 0x1 lookup 100; ip route replace default dev ${WG_IF} table 100; iptables -t nat -C POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ${WG_IF} -j MASQUERADE
+PostDown = ip rule del fwmark 0x1 lookup 100 2>/dev/null || true; ip route flush table 100 2>/dev/null || true; iptables -t nat -D POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || true
 
 [Peer]
 PublicKey = ${EXIT_PUBLIC_KEY}
@@ -204,74 +264,17 @@ EOF
   wg show || true
 
   echo
-  echo "✅ 现在："
-  echo "  - 访问出口内网 IP（${EXIT_WG_IP%/*}）一律走 WireGuard（不看端口）"
-  echo "  - 访问其它 IP：只有【源端口在分流列表里的流量】会走 wg0 → 出口机"
+  echo "✅ 当前行为："
+  echo "  - 访问出口内网 IP：${EXIT_WG_IP%/*} 一律走 WireGuard 内网"
+  echo "  - 访问其它 IP：只有【源端口在分流列表里的流量】走 wg0 → 出口机"
   echo "  - 其它流量走入口自己的公网，不影响 SSH。"
-}
-
-# ====================== 入口：策略路由 & 端口分流 ======================
-
-ensure_policy_routing_for_ports() {
-  if ! ip link show "${WG_IF}" &>/dev/null; then
-    return 0
-  fi
-
-  if ! ip rule show | grep -q "fwmark 0x1 lookup 100"; then
-    ip rule add fwmark 0x1 lookup 100
-  fi
-
-  ip route replace default dev ${WG_IF} table 100
-}
-
-apply_port_rules_from_file() {
-  [[ ! -f "$PORT_LIST_FILE" ]] && return 0
-
-  while read -r p; do
-    [[ -z "$p" ]] && continue
-    [[ "$p" =~ ^# ]] && continue
-    # 按“源端口”分流：本机哪个源端口的流量要走 wg
-    iptables -t mangle -C OUTPUT -p tcp --sport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
-      iptables -t mangle -A OUTPUT -p tcp --sport "$p" -j MARK --set-mark 0x1
-    iptables -t mangle -C OUTPUT -p udp --sport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
-      iptables -t mangle -A OUTPUT -p udp --sport "$p" -j MARK --set-mark 0x1
-  done < "$PORT_LIST_FILE"
-}
-
-add_port_to_list() {
-  local port="$1"
-  mkdir -p "$(dirname "$PORT_LIST_FILE")"
-  touch "$PORT_LIST_FILE"
-  if grep -qx "$port" "$PORT_LIST_FILE"; then
-    echo "端口 $port 已存在列表中。"
-    return 0
-  fi
-  echo "$port" >> "$PORT_LIST_FILE"
-  echo "已添加端口 $port 到分流列表。"
-}
-
-remove_port_from_list() {
-  local port="$1"
-  [[ ! -f "$PORT_LIST_FILE" ]] && return 0
-  if ! grep -qx "$port" "$PORT_LIST_FILE"; then
-    echo "端口 $port 不在列表中。"
-    return 0
-  fi
-  sed -i "\|^$port$|d" "$PORT_LIST_FILE"
-  echo "已从分流列表中删除端口 $port。"
-}
-
-remove_port_iptables_rules() {
-  local port="$1"
-  iptables -t mangle -D OUTPUT -p tcp --sport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
-  iptables -t mangle -D OUTPUT -p udp --sport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
 }
 
 manage_entry_ports() {
   echo "==== 入口服务器 端口分流管理 ===="
   echo "说明："
   echo "  - 这里管理的是【入口这台机器】本地源端口的分流规则；"
-  echo "  - 源端口在列表中的所有 TCP/UDP 流量 → 打 mark=0x1 → 经 wg0 → 出口机 NAT 出网；"
+  echo "  - 源端口在列表中的所有 TCP/UDP 流量 → 打 mark=0x1 → 走 wg0 → 出口机；"
   echo "  - 其它端口流量 → 走入口自己的公网。"
   echo
 
@@ -325,7 +328,7 @@ manage_entry_ports() {
   done
 }
 
-# ====================== 常规控制 ======================
+# ====================== 通用操作 ======================
 
 show_status() {
   echo "==== WireGuard 状态 ===="
@@ -363,8 +366,8 @@ uninstall_wg() {
   echo "==== 卸载 WireGuard（删除配置和程序 + 本脚本） ===="
   echo "此操作将会："
   echo "  - 停止 wg-quick@${WG_IF} 服务并取消开机自启"
-  echo "  - 删除 /etc/wireguard 内的配置和密钥、端口分流配置"
-  echo "  - 移除策略路由 / iptables 标记规则"
+  echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置"
+  echo "  - 移除策略路由 / iptables 标记 / NAT 规则"
   echo "  - 卸载 wireguard 与 wireguard-tools"
   echo "  - 删除当前脚本文件：$0"
   echo
@@ -377,10 +380,9 @@ uninstall_wg() {
 
       ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
       ip route flush table 100 2>/dev/null || true
-      iptables -t mangle -S OUTPUT 2>/dev/null | grep "MARK set 0x1" \
-        | sed 's/^-A /-D /' | while read -r line; do
-            iptables -t mangle $line 2>/dev/null || true
-          done
+
+      clear_mark_rules
+      iptables -t nat -D POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || true
 
       rm -f /etc/wireguard/${WG_IF}.conf \
             /etc/wireguard/exit_private.key /etc/wireguard/exit_public.key \
@@ -416,7 +418,7 @@ while true; do
   echo "4) 启动 WireGuard"
   echo "5) 停止 WireGuard"
   echo "6) 重启 WireGuard"
-  echo "7) 卸载 WireGuard"
+  echo "7) 卸载 WireGuard（并删除脚本）"
   echo "8) 管理入口端口分流（添加/查看/删除，自动生效）"
   echo "0) 退出"
   echo "===================================================="
@@ -432,6 +434,6 @@ while true; do
     7) uninstall_wg ;;
     8) manage_entry_ports ;;
     0) exit 0 ;;
-    *) echo "无效选项" ;;
+    *) echo "无效选项。" ;;
   esac
 done
