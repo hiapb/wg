@@ -3,6 +3,7 @@ set -e
 
 WG_IF="wg0"
 PORT_LIST_FILE="/etc/wireguard/.wg_ports"
+MODE_FILE="/etc/wireguard/.wg_mode"   # 记录入口当前模式：split / global
 
 if [[ $EUID -ne 0 ]]; then
   echo "请用 root 运行这个脚本： sudo bash wg.sh"
@@ -84,7 +85,7 @@ configure_exit() {
   read -rp "请输入【入口服务器公钥】（如果暂时没有可以直接回车跳过）: " ENTRY_PUBLIC_KEY
   ENTRY_PUBLIC_KEY=${ENTRY_PUBLIC_KEY:-CHANGE_ME_ENTRY_PUBLIC_KEY}
 
-  # 开启 IPv4 转发（不用 sysctl -p，避免报错中断）
+  # 开启 IPv4 转发
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
   if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
@@ -115,7 +116,7 @@ EOF
   wg show || true
 }
 
-# ====================== 入口服务器配置 ======================
+# ====================== 入口服务器：通用函数 ======================
 
 ensure_policy_routing_for_ports() {
   if ! ip link show "${WG_IF}" &>/dev/null; then
@@ -130,7 +131,7 @@ ensure_policy_routing_for_ports() {
 }
 
 clear_mark_rules() {
-  iptables -t mangle -S OUTPUT 2>/dev/null | grep "MARK --set-xmark 0x1" \
+  iptables -t mangle -S OUTPUT 2>/dev/null | grep "MARK --set-mark 0x1" \
     | sed 's/^-A /-D /' | while read -r line; do
         iptables -t mangle $line 2>/dev/null || true
       done
@@ -179,8 +180,92 @@ remove_port_iptables_rules() {
   iptables -t mangle -D OUTPUT -p udp --sport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
 }
 
+get_current_mode() {
+  if [[ -f "$MODE_FILE" ]]; then
+    mode=$(cat "$MODE_FILE" 2>/dev/null || echo "split")
+  else
+    mode="split"
+  fi
+  echo "$mode"
+}
+
+set_mode_flag() {
+  local mode="$1"
+  echo "$mode" > "$MODE_FILE"
+}
+
+enable_global_mode() {
+  echo "[*] 切换为【全局模式（除 SSH/WG/lo 外全部走出口）】..."
+  ensure_policy_routing_for_ports
+  clear_mark_rules
+
+  # 不处理 lo
+  iptables -t mangle -C OUTPUT -o lo -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -o lo -j RETURN
+
+  # 保证 SSH 不被标记（源端口 22）
+  iptables -t mangle -C OUTPUT -p tcp --sport 22 -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p tcp --sport 22 -j RETURN
+
+  # 保证 WireGuard 隧道本身不被标记（UDP 51820）
+  iptables -t mangle -C OUTPUT -p udp --sport 51820 -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p udp --sport 51820 -j RETURN
+  iptables -t mangle -C OUTPUT -p udp --dport 51820 -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p udp --dport 51820 -j RETURN
+
+  # 其余所有出站流量全部打 mark=0x1 → table100 → wg0
+  iptables -t mangle -C OUTPUT -j MARK --set-mark 0x1 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -j MARK --set-mark 0x1
+
+  set_mode_flag "global"
+  echo "✅ 已切到【全局模式】，SSH 不走 wg，其它流量默认通过出口。"
+}
+
+enable_split_mode() {
+  echo "[*] 切换为【端口分流模式】..."
+  ensure_policy_routing_for_ports
+  clear_mark_rules
+  apply_port_rules_from_file
+  set_mode_flag "split"
+  echo "✅ 已切回【端口分流模式】，只有端口列表中源端口才走出口。"
+}
+
+apply_current_mode() {
+  local mode
+  mode=$(get_current_mode)
+  if [[ "$mode" == "global" ]]; then
+    enable_global_mode
+  else
+    enable_split_mode
+  fi
+}
+
+manage_entry_mode() {
+  echo "==== 入口服务器 模式切换 ===="
+  while true; do
+    local mode
+    mode=$(get_current_mode)
+    echo
+    echo "当前模式：$mode"
+    echo "1) 切换为【全局模式】（除 SSH/WG/lo 外全部走出口）"
+    echo "2) 切换为【端口分流模式】（只列表端口走出口）"
+    echo "3) 仅查看当前模式"
+    echo "0) 返回主菜单"
+    read -rp "请选择: " sub
+    case "$sub" in
+      1) enable_global_mode ;;
+      2) enable_split_mode ;;
+      3) ;;
+      0) break ;;
+      *) echo "无效选项。" ;;
+    esac
+  done
+}
+
+# ====================== 入口服务器配置（只配一次） ======================
+
 configure_entry() {
-  echo "==== 配置为【入口服务器】（连出去的那台，端口分流 + 内网直连） ===="
+  echo "==== 配置为【入口服务器】（只配置一次，之后用模式切换） ===="
 
   install_wireguard
 
@@ -232,8 +317,6 @@ configure_entry() {
   echo "================================================"
   echo
 
-  # 入口机：Table=off，不改默认路由；用 fwmark+table100 做分流
-  # PostUp 里：建策略路由 & NAT 到 wg0（SNAT/MASQUERADE 成 10.0.0.2）
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
 Address = ${WG_ADDR}
@@ -257,24 +340,26 @@ EOF
   wg-quick up ${WG_IF}
 
   ensure_policy_routing_for_ports
-  apply_port_rules_from_file
+
+  # 默认先用端口分流模式
+  set_mode_flag "split"
+  apply_current_mode
 
   echo
-  echo "入口服务器基础配置完成，当前状态："
+  echo "入口服务器配置完成，当前状态："
   wg show || true
 
   echo
-  echo "✅ 当前行为："
-  echo "  - 访问出口内网 IP：${EXIT_WG_IP%/*} 一律走 WireGuard 内网"
-  echo "  - 访问其它 IP：只有【源端口在分流列表里的流量】走 wg0 → 出口机"
-  echo "  - 其它流量走入口自己的公网，不影响 SSH。"
+  echo "✅ 之后如果要切换："
+  echo "  - 用本脚本菜单 8 管理端口分流（列表）。"
+  echo "  - 用本脚本菜单 9 切换【全局模式】 / 【端口分流模式】。"
 }
 
 manage_entry_ports() {
   echo "==== 入口服务器 端口分流管理 ===="
   echo "说明："
-  echo "  - 这里管理的是【入口这台机器】本地源端口的分流规则；"
-  echo "  - 源端口在列表中的所有 TCP/UDP 流量 → 打 mark=0x1 → 走 wg0 → 出口机；"
+  echo "  - 管的是【入口这台机器】本地源端口的分流规则；"
+  echo "  - 源端口在列表中的所有 TCP/UDP 流量 → mark=0x1 → table100 → wg0 → 出口；"
   echo "  - 其它端口流量 → 走入口自己的公网。"
   echo
 
@@ -322,8 +407,7 @@ manage_entry_ports() {
         break
         ;;
       *)
-        echo "无效选项。"
-        ;;
+        echo "无效选项。" ;;
     esac
   done
 }
@@ -343,7 +427,7 @@ start_wg() {
   echo "[*] 启动 WireGuard (${WG_IF})..."
   wg-quick up ${WG_IF} || true
   ensure_policy_routing_for_ports
-  apply_port_rules_from_file
+  apply_current_mode
   wg show || true
 }
 
@@ -358,7 +442,7 @@ restart_wg() {
   wg-quick down ${WG_IF} 2>/dev/null || true
   wg-quick up ${WG_IF} || true
   ensure_policy_routing_for_ports
-  apply_port_rules_from_file
+  apply_current_mode
   wg show || true
 }
 
@@ -366,7 +450,7 @@ uninstall_wg() {
   echo "==== 卸载 WireGuard（删除配置和程序 + 本脚本） ===="
   echo "此操作将会："
   echo "  - 停止 wg-quick@${WG_IF} 服务并取消开机自启"
-  echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置"
+  echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置、模式配置"
   echo "  - 移除策略路由 / iptables 标记 / NAT 规则"
   echo "  - 卸载 wireguard 与 wireguard-tools"
   echo "  - 删除当前脚本文件：$0"
@@ -388,7 +472,7 @@ uninstall_wg() {
             /etc/wireguard/exit_private.key /etc/wireguard/exit_public.key \
             /etc/wireguard/entry_private.key /etc/wireguard/entry_public.key \
             /etc/wireguard/.exit_public_ip \
-            "$PORT_LIST_FILE" 2>/dev/null || true
+            "$PORT_LIST_FILE" "$MODE_FILE" 2>/dev/null || true
       rmdir /etc/wireguard 2>/dev/null || true
 
       export DEBIAN_FRONTEND=noninteractive
@@ -413,13 +497,14 @@ while true; do
   echo
   echo "================ WireGuard 一键脚本 ================"
   echo "1) 配置为 出口服务器"
-  echo "2) 配置为 入口服务器（端口分流 + 内网直连）"
+  echo "2) 配置为 入口服务器（只配置一次）"
   echo "3) 查看 WireGuard 状态"
   echo "4) 启动 WireGuard"
   echo "5) 停止 WireGuard"
   echo "6) 重启 WireGuard"
   echo "7) 卸载 WireGuard（并删除脚本）"
   echo "8) 管理入口端口分流（添加/查看/删除，自动生效）"
+  echo "9) 管理入口模式（全局 / 端口分流）"
   echo "0) 退出"
   echo "===================================================="
   read -rp "请选择: " choice
@@ -433,6 +518,7 @@ while true; do
     6) restart_wg ;;
     7) uninstall_wg ;;
     8) manage_entry_ports ;;
+    9) manage_entry_mode ;;
     0) exit 0 ;;
     *) echo "无效选项。" ;;
   esac
