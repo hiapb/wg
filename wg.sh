@@ -141,7 +141,6 @@ ensure_policy_routing_for_ports() {
   ip route replace default dev ${WG_IF} table 100
 }
 
-# 关键修复：清掉 OUTPUT 里所有 MARK 相关规则（不管是全局还是端口）
 clear_mark_rules() {
   iptables -t mangle -S OUTPUT 2>/dev/null | grep " MARK " \
     | sed 's/^-A /-D /' | while read -r line; do
@@ -298,9 +297,9 @@ enable_full_port_forward_to_exit_all() {
 
   echo "[*] 开启【全端口 1:1 转发】：A 公网 IP:任意 TCP 端口 → B(${exit_ip}):同端口"
 
-  # 1) 所有从外网进来的 TCP，DNAT 到 B（端口不改）
-  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp -j DNAT --to-destination "${exit_ip}" 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp -j DNAT --to-destination "${exit_ip}"
+  # 1) 所有从外网进来的 TCP，DNAT 到 B（精准排除 22 端口，防止机器失联）
+  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}"
 
   # 2) FORWARD 放行 外网→wg0
   iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
@@ -315,6 +314,19 @@ enable_full_port_forward_to_exit_all() {
     iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
 
   echo "✅ 已开启【全端口 1:1 转发】：O → A:任意 TCP 端口 = O → B(${exit_ip}):同端口"
+}
+
+disable_full_port_forward_to_exit_all() {
+  local exit_ip wan_if
+  if [[ -f "$EXIT_WG_IP_FILE" ]]; then
+    exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
+  fi
+  [[ -z "$exit_ip" ]] && return 0
+  wan_if=$(get_wan_if)
+
+  iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || true
+  iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 }
 
 enable_global_mode() {
@@ -349,6 +361,7 @@ enable_global_mode() {
 
 enable_split_mode() {
   echo "[*] 切换为【端口分流模式】..."
+  disable_full_port_forward_to_exit_all
   ensure_policy_routing_for_ports
   clear_mark_rules
   apply_port_rules_from_file
@@ -596,8 +609,6 @@ uninstall_wg() {
       systemctl stop wg-quick@${WG_IF}.service 2>/dev/null || true
       systemctl disable wg-quick@${WG_IF}.service 2>/dev/null || true
       wg-quick down ${WG_IF} 2>/dev/null || true
-
-      # 尝试移除分流端口对应的转发规则
       if [[ -f "$PORT_LIST_FILE" ]]; then
         while read -r p; do
           [[ -z "$p" ]] && continue
@@ -605,12 +616,11 @@ uninstall_wg() {
         done < "$PORT_LIST_FILE"
       fi
 
-      # 尝试移除全端口 1:1 转发规则
       if [[ -f "$EXIT_WG_IP_FILE" ]]; then
         exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
         if [[ -n "$exit_ip" ]]; then
           wan_if=$(get_wan_if)
-          iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp -j DNAT --to-destination "${exit_ip}" 2>/dev/null || true
+          iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || true
           iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
           iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
         fi
