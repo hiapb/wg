@@ -957,34 +957,6 @@ remove_port() {
   apply_routing_mode
 }
 
-base64_encode() { base64 2>/dev/null | tr -d '\r\n'; }
-base64_decode() { printf '%s' "$1" | base64 -d 2>/dev/null; }
-
-export_exit_code() {
-  local host port entry_addr exit_addr public payload
-  host="$(read_value "$REMOTE_HOST_FILE")"; port="$(read_value "$REMOTE_PORT_FILE")"
-  entry_addr="$(read_value "$PEER_ADDRESS_FILE")"; exit_addr="$(read_value "$WG_ADDRESS_FILE")"
-  public="$(read_value "$WG_PUBLIC_KEY_FILE")"
-  payload="${host}|${port}|${entry_addr}|${exit_addr}|${public}"
-  printf 'WG1:%s\n' "$(printf '%s' "$payload" | base64_encode)"
-}
-
-import_exit_code() {
-  local code="$1" payload host port entry_addr exit_addr public endpoint_ip
-  [[ "$code" == WG1:* ]] || { err '连接码前缀无效，应为 WG1:'; return 1; }
-  payload="$(base64_decode "${code#WG1:}")" || { err '连接码解码失败'; return 1; }
-  IFS='|' read -r host port entry_addr exit_addr public <<< "$payload"
-  valid_host "$host" && valid_port "$port" && valid_ipv4_cidr "$entry_addr" && \
-    valid_ipv4_cidr "$exit_addr" && valid_wg_key "$public" || { err '连接码字段无效'; return 1; }
-  [[ "${entry_addr%%/*}" != "${exit_addr%%/*}" ]] || { err '连接码中的入口和出口 WG 地址不能相同'; return 1; }
-  endpoint_ip="$(select_endpoint_ipv4 "$host")" || { err "无法解析出口地址 ${host}"; return 1; }
-  write_value "$REMOTE_HOST_FILE" "$host"; write_value "$REMOTE_PORT_FILE" "$port"
-  write_value "$WG_ADDRESS_FILE" "$entry_addr"; write_value "$PEER_ADDRESS_FILE" "$exit_addr"
-  write_value "$PEER_PUBLIC_KEY_FILE" "$public"; write_value "$ENDPOINT_IP_FILE" "$endpoint_ip"
-  write_value "$WAN_IF_FILE" "$(get_wan_if)"
-  ok '已导入出口连接码'
-}
-
 configure_exit() {
   local host port address entry_address wan_if input_wan_if public entry_public
   set_role exit; ensure_dirs
@@ -994,7 +966,7 @@ configure_exit() {
   echo '可粘贴自定义私钥；回车将自动生成或复用现有私钥。'
   ensure_local_wg_identity '出口服务器'
   public="$(read_value "$WG_PUBLIC_KEY_FILE")"
-  print_block '出口 WireGuard 公钥'
+  print_block '出口 WireGuard 公钥（配置入口服务器时填写）'
   printf '%s\n' "$public"
   read -rp '入口服务器 WireGuard 公钥（首次可回车稍后填写）: ' entry_public
   if [[ -n "$entry_public" ]]; then
@@ -1022,13 +994,12 @@ configure_exit() {
   write_value "$WAN_IF_FILE" "$wan_if"
   ensure_ip_forward; write_exit_wg_config; start_wg
   print_block '出口配置完成'
-  printf '出口地址: %s:%s\n出口 WG 地址: %s\n出口公钥: %s\n\n连接码：\n' "$host" "$port" "$address" "$public"
-  export_exit_code
-  [[ -s "$PEER_PUBLIC_KEY_FILE" ]] || print_warn '下一步在入口导入连接码，再回到出口菜单 11 → 3 填入入口公钥。'
+  printf '出口地址: %s:%s\n出口 WG 地址: %s\n出口公钥: %s\n' "$host" "$port" "$address" "$public"
+  [[ -s "$PEER_PUBLIC_KEY_FILE" ]] || print_warn '入口公钥尚未配置，请在出口高级管理中更新入口公钥。'
 }
 
 configure_entry() {
-  local code host port address exit_address endpoint_ip public default_if
+  local host port address exit_address endpoint_ip public default_if
   set_role entry; ensure_dirs
   print_block '配置 WireGuard 入口服务器'
   install_packages
@@ -1038,22 +1009,17 @@ configure_entry() {
   public="$(read_value "$WG_PUBLIC_KEY_FILE")"
   print_block '入口 WireGuard 公钥（需要填到出口机）'
   printf '%s\n' "$public"
-  read -rp '粘贴出口连接码（没有则回车手动填写）: ' code
-  if [[ -n "$code" ]]; then
-    import_exit_code "$code"
-  else
-    prompt_wg_key '出口服务器' "$PEER_PUBLIC_KEY_FILE"
-    read -rp '出口公网 IP / 域名: ' host; host="$(normalize_host "$host")"
-    read -rp "出口 WireGuard UDP 端口 (默认 ${DEFAULT_WG_PORT}): " port; port="${port:-$DEFAULT_WG_PORT}"
-    read -rp "入口 WireGuard 内网地址 (默认 ${DEFAULT_ENTRY_ADDRESS}): " address; address="${address:-$DEFAULT_ENTRY_ADDRESS}"
-    read -rp '出口 WireGuard 内网地址 (默认 10.0.0.1/32): ' exit_address; exit_address="${exit_address:-10.0.0.1/32}"
-    valid_host "$host" && valid_port "$port" && valid_ipv4_cidr "$address" && valid_ipv4_cidr "$exit_address" || { err '入口参数无效'; return 1; }
-    [[ "${address%%/*}" != "${exit_address%%/*}" ]] || { err '入口和出口 WG 地址不能相同'; return 1; }
-    endpoint_ip="$(select_endpoint_ipv4 "$host")" || { err "无法解析出口地址 ${host}"; return 1; }
-    write_value "$REMOTE_HOST_FILE" "$host"; write_value "$REMOTE_PORT_FILE" "$port"
-    write_value "$WG_ADDRESS_FILE" "$address"; write_value "$PEER_ADDRESS_FILE" "$exit_address"
-    write_value "$ENDPOINT_IP_FILE" "$endpoint_ip"
-  fi
+  prompt_wg_key '出口服务器' "$PEER_PUBLIC_KEY_FILE"
+  read -rp '出口公网 IP / 域名: ' host; host="$(normalize_host "$host")"
+  read -rp "出口 WireGuard UDP 端口 (默认 ${DEFAULT_WG_PORT}): " port; port="${port:-$DEFAULT_WG_PORT}"
+  read -rp "入口 WireGuard 内网地址 (默认 ${DEFAULT_ENTRY_ADDRESS}): " address; address="${address:-$DEFAULT_ENTRY_ADDRESS}"
+  read -rp '出口 WireGuard 内网地址 (默认 10.0.0.1/32): ' exit_address; exit_address="${exit_address:-10.0.0.1/32}"
+  valid_host "$host" && valid_port "$port" && valid_ipv4_cidr "$address" && valid_ipv4_cidr "$exit_address" || { err '入口参数无效'; return 1; }
+  [[ "${address%%/*}" != "${exit_address%%/*}" ]] || { err '入口和出口 WG 地址不能相同'; return 1; }
+  endpoint_ip="$(select_endpoint_ipv4 "$host")" || { err "无法解析出口地址 ${host}"; return 1; }
+  write_value "$REMOTE_HOST_FILE" "$host"; write_value "$REMOTE_PORT_FILE" "$port"
+  write_value "$WG_ADDRESS_FILE" "$address"; write_value "$PEER_ADDRESS_FILE" "$exit_address"
+  write_value "$ENDPOINT_IP_FILE" "$endpoint_ip"
   default_if="$(get_wan_if)"
   write_value "$WAN_IF_FILE" "$default_if"; set_mode_flag split
   write_entry_wg_config
@@ -1191,13 +1157,13 @@ manage_exit_node() {
   local choice port
   while true; do
     print_block '出口高级管理'
-    echo '1) 查看状态和连接码'
+    echo '1) 查看状态'
     echo '2) 修改 WG UDP 监听端口'
     echo '3) 更新入口公钥'
     echo '0) 返回'
     read -rp '请选择: ' choice
     case "$choice" in
-      1) show_status; printf '\n连接码：\n'; export_exit_code;;
+      1) show_status;;
       2)
         read -rp '新 WireGuard UDP 端口: ' port
         valid_port "$port" || { print_err '端口无效'; continue; }
