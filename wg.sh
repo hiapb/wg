@@ -220,14 +220,35 @@ ensure_wg_conf_is_owned() {
 }
 
 ensure_local_wg_identity() {
-  local private public
+  local role_label="$1" supplied_private private_key public_key old_public
   ensure_dirs
-  if [[ -s "$WG_PRIVATE_KEY_FILE" && -s "$WG_PUBLIC_KEY_FILE" ]]; then return 0; fi
-  private="$(wg genkey)"
-  public="$(printf '%s' "$private" | wg pubkey)"
-  valid_wg_key "$private" && valid_wg_key "$public" || { err 'WireGuard 密钥生成失败'; return 1; }
-  write_value "$WG_PRIVATE_KEY_FILE" "$private"
-  write_value "$WG_PUBLIC_KEY_FILE" "$public"
+  old_public="$(read_value "$WG_PUBLIC_KEY_FILE")"
+  while true; do
+    if [[ -s "$WG_PRIVATE_KEY_FILE" ]]; then
+      read -rp "自定义${role_label} WireGuard 私钥（回车复用现有）: " supplied_private
+    else
+      read -rp "自定义${role_label} WireGuard 私钥（回车自动生成）: " supplied_private
+    fi
+    supplied_private="${supplied_private//[[:space:]]/}"
+    if [[ -n "$supplied_private" ]]; then
+      private_key="$supplied_private"
+    elif [[ -s "$WG_PRIVATE_KEY_FILE" ]]; then
+      private_key="$(read_value "$WG_PRIVATE_KEY_FILE")"
+    else
+      private_key="$(wg genkey)"
+    fi
+    public_key="$(printf '%s\n' "$private_key" | wg pubkey 2>/dev/null || true)"
+    if valid_wg_key "$private_key" && valid_wg_key "$public_key"; then
+      write_value "$WG_PRIVATE_KEY_FILE" "$private_key"
+      write_value "$WG_PUBLIC_KEY_FILE" "$public_key"
+      if [[ -n "$old_public" && "$old_public" != "$public_key" ]]; then
+        print_warn '本机 WireGuard 公钥已改变，必须在对端更新为新公钥'
+      fi
+      return 0
+    fi
+    print_err 'WireGuard 私钥无效，请重新输入'
+    supplied_private=''
+  done
 }
 
 prompt_wg_key() {
@@ -968,7 +989,10 @@ configure_exit() {
   local host port address entry_address wan_if input_wan_if public entry_public
   set_role exit; ensure_dirs
   print_block '配置 WireGuard 出口服务器'
-  install_packages; ensure_local_wg_identity
+  install_packages
+  print_block '配置出口 WireGuard 身份'
+  echo '可粘贴自定义私钥；回车将自动生成或复用现有私钥。'
+  ensure_local_wg_identity '出口服务器'
   public="$(read_value "$WG_PUBLIC_KEY_FILE")"
   print_block '出口 WireGuard 公钥'
   printf '%s\n' "$public"
@@ -1007,7 +1031,10 @@ configure_entry() {
   local code host port address exit_address endpoint_ip public default_if
   set_role entry; ensure_dirs
   print_block '配置 WireGuard 入口服务器'
-  install_packages; ensure_local_wg_identity
+  install_packages
+  print_block '配置入口 WireGuard 身份'
+  echo '可粘贴自定义私钥；回车将自动生成或复用现有私钥。'
+  ensure_local_wg_identity '入口服务器'
   public="$(read_value "$WG_PUBLIC_KEY_FILE")"
   print_block '入口 WireGuard 公钥（需要填到出口机）'
   printf '%s\n' "$public"
